@@ -267,12 +267,9 @@ function handlePosition(pos) {
   const speedMs = pos.coords.speed;
   app.accuracy = pos.coords.accuracy;
 
-  if (speedMs === null || speedMs === undefined || speedMs < 0) {
-    renderGPS();
-    return;
-  }
-
-  const speedKmh = speedMs * 3.6;
+  // iOS Safariは停車中に speed が null になる。停車として扱う
+  const speedIsNull = (speedMs === null || speedMs === undefined || speedMs < 0);
+  const speedKmh = speedIsNull ? 0 : speedMs * 3.6;
   app.speed = speedKmh;
   const now = performance.now();
 
@@ -288,7 +285,7 @@ function handlePosition(pos) {
       app.stoppedSince = null;
     }
   } else if (app.state === STATES.ARMED) {
-    if (speedKmh >= START_THRESHOLD_KMH) {
+    if (!speedIsNull && speedKmh >= START_THRESHOLD_KMH) {
       let startTime = now;
       if (app.lastSample && app.lastSample.speedKmh < START_THRESHOLD_KMH) {
         startTime = app.lastSample.time;
@@ -298,6 +295,10 @@ function handlePosition(pos) {
       setState(STATES.RUNNING);
     }
   } else if (app.state === STATES.RUNNING) {
+    if (speedIsNull) {
+      render();
+      return;
+    }
     for (const target of SPLIT_TARGETS) {
       if (app.splits[target] === undefined && speedKmh >= target) {
         let crossTime = now;
