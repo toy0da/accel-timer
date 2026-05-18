@@ -110,6 +110,7 @@
     <div class="gps-indicator">
       <div class="gps-dot" id="gpsDot"></div>
       <span>GPS <span id="gpsAccuracy">--</span></span>
+      <span id="speedSource" style="color:#4B5563;margin-left:4px;"></span>
     </div>
   </div>
 
@@ -158,7 +159,7 @@
 <script>
 'use strict';
 
-const VERSION = 'v0.3.1';
+const VERSION = 'v0.4.0';
 const BUILD_DATE = '2026-05-19';
 
 const STATES = {
@@ -193,7 +194,21 @@ const app = {
   showHistory: false,
   stoppedSince: null,
   stopProgressRaf: null,
+  lastPosition: null,           // 速度自前計算用の前回位置
+  speedSource: '--',            // 'GPS'(Doppler) または 'CALC'(自前計算)
 };
+
+// Haversine距離 (meters)
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = function(d) { return d * Math.PI / 180; };
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+            Math.sin(dLon/2) * Math.sin(dLon/2);
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
 
 function loadHistory() {
   try {
@@ -229,6 +244,8 @@ function startMeasurement() {
   app.startTime = null;
   app.lastSample = null;
   app.stoppedSince = null;
+  app.lastPosition = null;
+  app.speedSource = '--';
   render();
 
   if (app.watchId !== null) navigator.geolocation.clearWatch(app.watchId);
@@ -272,10 +289,45 @@ function handlePosition(pos) {
   const speedMs = pos.coords.speed;
   app.accuracy = pos.coords.accuracy;
 
-  // iOS Safariは停車中に speed が null になる。停車として扱う
-  const speedIsNull = (speedMs === null || speedMs === undefined || speedMs < 0);
-  const speedKmh = speedIsNull ? 0 : speedMs * 3.6;
+  // Doppler由来のspeedが取れない場合、座標から自前計算する
+  const dopplerAvailable = (speedMs !== null && speedMs !== undefined && speedMs >= 0);
+  let speedKmh;
+  if (dopplerAvailable) {
+    speedKmh = speedMs * 3.6;
+    app.speedSource = 'GPS';
+  } else if (app.lastPosition) {
+    const dt = (pos.timestamp - app.lastPosition.timestamp) / 1000;
+    if (dt > 0.05) {
+      const dist = haversineMeters(
+        app.lastPosition.lat, app.lastPosition.lon,
+        pos.coords.latitude, pos.coords.longitude
+      );
+      const computedMs = dist / dt;
+      // GPS精度より十分大きい移動でないとノイズに埋もれる
+      const minMove = Math.max(2, (app.accuracy || 0) * 0.3);
+      if (dist > minMove) {
+        speedKmh = computedMs * 3.6;
+        app.speedSource = 'CALC';
+      } else {
+        speedKmh = 0;
+        app.speedSource = 'CALC';
+      }
+    } else {
+      speedKmh = 0;
+      app.speedSource = 'CALC';
+    }
+  } else {
+    speedKmh = 0;
+    app.speedSource = '--';
+  }
+
   app.speed = speedKmh;
+  app.lastPosition = {
+    lat: pos.coords.latitude,
+    lon: pos.coords.longitude,
+    timestamp: pos.timestamp
+  };
+
   const now = performance.now();
 
   if (app.state === STATES.WAITING_STOP) {
@@ -290,7 +342,7 @@ function handlePosition(pos) {
       app.stoppedSince = null;
     }
   } else if (app.state === STATES.ARMED) {
-    if (!speedIsNull && speedKmh >= START_THRESHOLD_KMH) {
+    if (speedKmh >= START_THRESHOLD_KMH) {
       let startTime = now;
       if (app.lastSample && app.lastSample.speedKmh < START_THRESHOLD_KMH) {
         startTime = app.lastSample.time;
@@ -300,10 +352,6 @@ function handlePosition(pos) {
       setState(STATES.RUNNING);
     }
   } else if (app.state === STATES.RUNNING) {
-    if (speedIsNull) {
-      render();
-      return;
-    }
     for (const target of SPLIT_TARGETS) {
       if (app.splits[target] === undefined && speedKmh >= target) {
         let crossTime = now;
@@ -386,6 +434,7 @@ function renderGPS() {
   dot.style.background = color;
   dot.style.boxShadow = '0 0 6px ' + color;
   $('gpsAccuracy').textContent = acc ? '±' + acc.toFixed(0) + 'm' : '--';
+  $('speedSource').textContent = app.speedSource !== '--' ? '· ' + app.speedSource : '';
 }
 
 function renderState() {
