@@ -25,6 +25,8 @@
     padding: 20px 16px 40px;
     padding-top: max(20px, env(safe-area-inset-top));
   }
+  .mono { font-family: "JetBrains Mono", monospace; }
+
   .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; }
   .title-small { font-family: "JetBrains Mono", monospace; font-size: 10px; letter-spacing: 0.3em; color: #6B7280; font-weight: 700; }
   .title { font-size: 22px; font-weight: 800; margin-top: 2px; letter-spacing: -0.02em; }
@@ -150,7 +152,7 @@
 <script>
 'use strict';
 
-const VERSION = 'v0.7.0';
+const VERSION = 'v0.2.0-original';
 const BUILD_DATE = '2026-05-19';
 
 const STATES = {
@@ -221,9 +223,7 @@ function startMeasurement() {
 
   app.watchId = navigator.geolocation.watchPosition(
     function(pos) {
-      if (app.state === STATES.ARMING) {
-        setState(STATES.ARMED);
-      }
+      if (app.state === STATES.ARMING) setState(STATES.ARMED);
       handlePosition(pos);
     },
     function(err) {
@@ -242,21 +242,16 @@ function startMeasurement() {
 }
 
 function stopMeasurement() {
-  // GPSは切らない(再開時のコールドスタート回避)
+  if (app.watchId !== null) {
+    navigator.geolocation.clearWatch(app.watchId);
+    app.watchId = null;
+  }
   setState(STATES.IDLE);
   app.speed = 0;
   app.elapsedMs = 0;
   releaseWakeLock();
   render();
 }
-
-// ページを離れる時にGPSを確実に停止
-window.addEventListener('beforeunload', function() {
-  if (app.watchId !== null) {
-    navigator.geolocation.clearWatch(app.watchId);
-    app.watchId = null;
-  }
-});
 
 function handlePosition(pos) {
   const speedMs = pos.coords.speed;
