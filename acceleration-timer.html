@@ -69,12 +69,8 @@
 
   .message { text-align: center; font-size: 13px; padding: 12px; border-radius: 12px; margin-bottom: 20px; }
   .message.warning { color: #FCD34D; background: rgba(252, 211, 77, 0.08); }
-  .message.info { color: #FB923C; background: rgba(251, 146, 60, 0.08); }
   .message.success { color: #34D399; background: rgba(52, 211, 153, 0.08); font-weight: 700; font-size: 14px; }
   .message.error { color: #F87171; background: rgba(248, 113, 113, 0.1); border: 1px solid rgba(248, 113, 113, 0.3); text-align: left; }
-
-  .progress-bar { width: 100%; height: 3px; background: rgba(251, 146, 60, 0.15); border-radius: 2px; overflow: hidden; margin-top: 8px; }
-  .progress-fill { height: 100%; background: #FB923C; border-radius: 2px; transition: width 0.1s linear; }
 
   .history-section { margin-top: 36px; }
   .history-header { display: flex; justify-content: space-between; align-items: center; cursor: pointer; padding: 8px 0; user-select: none; }
@@ -110,7 +106,6 @@
     <div class="gps-indicator">
       <div class="gps-dot" id="gpsDot"></div>
       <span>GPS <span id="gpsAccuracy">--</span></span>
-      <span id="speedSource" style="color:#4B5563;margin-left:4px;"></span>
     </div>
   </div>
 
@@ -135,11 +130,7 @@
 
   <button class="btn-action" id="btnAction">計測開始</button>
 
-  <div class="message info hidden" id="msgWaitingStop">
-    停車してください
-    <div class="progress-bar"><div class="progress-fill" id="stopProgress" style="width: 0%"></div></div>
-  </div>
-  <div class="message warning hidden" id="msgArmed">停車確認OK。発進してください</div>
+  <div class="message warning hidden" id="msgArmed">停車状態から発進してください</div>
   <div class="message success hidden" id="msgFinished"></div>
   <div class="message error hidden" id="msgError"></div>
 
@@ -159,20 +150,17 @@
 <script>
 'use strict';
 
-const VERSION = 'v0.5.0';
+const VERSION = 'v0.6.0';
 const BUILD_DATE = '2026-05-19';
 
 const STATES = {
   IDLE: 'idle',
   ARMING: 'arming',
-  WAITING_STOP: 'waiting_stop',
   ARMED: 'armed',
   RUNNING: 'running',
   FINISHED: 'finished'
 };
 const SPLIT_TARGETS = [50, 80, 100];
-const STOP_THRESHOLD_KMH = 1.0;
-const STOP_CONFIRM_MS = 1500;
 const START_THRESHOLD_KMH = 1.5;
 const TARGET_KMH = 100;
 const STORAGE_KEY = 'accel_history_v1';
@@ -192,23 +180,7 @@ const app = {
   confirmClear: false,
   confirmClearTimer: null,
   showHistory: false,
-  stoppedSince: null,
-  stopProgressRaf: null,
-  lastPosition: null,           // 速度自前計算用の前回位置
-  speedSource: '--',            // 'GPS'(Doppler) または 'CALC'(自前計算)
 };
-
-// Haversine距離 (meters)
-function haversineMeters(lat1, lon1, lat2, lon2) {
-  const R = 6371000;
-  const toRad = function(d) { return d * Math.PI / 180; };
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-            Math.sin(dLon/2) * Math.sin(dLon/2);
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
 
 function loadHistory() {
   try {
@@ -243,21 +215,18 @@ function startMeasurement() {
   app.splits = {};
   app.startTime = null;
   app.lastSample = null;
-  app.stoppedSince = null;
-  app.lastPosition = null;
-  app.speedSource = '--';
   render();
 
   if (app.watchId !== null) navigator.geolocation.clearWatch(app.watchId);
 
   app.watchId = navigator.geolocation.watchPosition(
-    (pos) => {
+    function(pos) {
       if (app.state === STATES.ARMING) {
-        setState(STATES.WAITING_STOP);
+        setState(STATES.ARMED);
       }
       handlePosition(pos);
     },
-    (err) => {
+    function(err) {
       let msg = 'GPSエラー';
       if (err.code === 1) msg = '位置情報のアクセスが拒否されました。';
       else if (err.code === 2) msg = '現在位置を取得できません。屋外でお試しください。';
@@ -280,7 +249,6 @@ function stopMeasurement() {
   setState(STATES.IDLE);
   app.speed = 0;
   app.elapsedMs = 0;
-  app.stoppedSince = null;
   releaseWakeLock();
   render();
 }
@@ -288,37 +256,18 @@ function stopMeasurement() {
 function handlePosition(pos) {
   const speedMs = pos.coords.speed;
   app.accuracy = pos.coords.accuracy;
-  const now = performance.now();
 
-  const dopplerAvailable = (speedMs !== null && speedMs !== undefined && speedMs >= 0);
-
-  // 表示はDoppler速度のみ使用。取れない時は前回値を維持（v0.2と同じ挙動）
-  if (dopplerAvailable) {
-    app.speed = speedMs * 3.6;
-    app.speedSource = 'GPS';
-  } else {
-    app.speedSource = 'HOLD';
-    // app.speed は更新しない
+  if (speedMs === null || speedMs === undefined || speedMs < 0) {
+    renderGPS();
+    return;
   }
 
-  // 状態遷移用の速度値
-  const speedForState = dopplerAvailable ? speedMs * 3.6 : 0;
+  const speedKmh = speedMs * 3.6;
+  app.speed = speedKmh;
+  const now = performance.now();
 
-  if (app.state === STATES.WAITING_STOP) {
-    // 停車確認: nullは「停車中」として扱う(iOSは停車時にnullを返すため)
-    if (speedForState < STOP_THRESHOLD_KMH) {
-      if (app.stoppedSince === null) {
-        app.stoppedSince = now;
-      } else if (now - app.stoppedSince >= STOP_CONFIRM_MS) {
-        setState(STATES.ARMED);
-        app.stoppedSince = null;
-      }
-    } else {
-      app.stoppedSince = null;
-    }
-  } else if (app.state === STATES.ARMED) {
-    // 発進検知: Doppler有効時のみ。誤検出防止
-    if (dopplerAvailable && speedForState >= START_THRESHOLD_KMH) {
+  if (app.state === STATES.ARMED) {
+    if (speedKmh >= START_THRESHOLD_KMH) {
       let startTime = now;
       if (app.lastSample && app.lastSample.speedKmh < START_THRESHOLD_KMH) {
         startTime = app.lastSample.time;
@@ -328,16 +277,12 @@ function handlePosition(pos) {
       setState(STATES.RUNNING);
     }
   } else if (app.state === STATES.RUNNING) {
-    if (!dopplerAvailable) {
-      render();
-      return;
-    }
     for (const target of SPLIT_TARGETS) {
-      if (app.splits[target] === undefined && speedForState >= target) {
+      if (app.splits[target] === undefined && speedKmh >= target) {
         let crossTime = now;
         if (app.lastSample && app.lastSample.speedKmh < target) {
           const prev = app.lastSample;
-          const fraction = (target - prev.speedKmh) / (speedForState - prev.speedKmh);
+          const fraction = (target - prev.speedKmh) / (speedKmh - prev.speedKmh);
           crossTime = prev.time + fraction * (now - prev.time);
         }
         const splitMs = crossTime - app.startTime;
@@ -351,9 +296,7 @@ function handlePosition(pos) {
     }
   }
 
-  if (dopplerAvailable) {
-    app.lastSample = { speedKmh: speedForState, time: now };
-  }
+  app.lastSample = { speedKmh: speedKmh, time: now };
   render();
 }
 
@@ -372,12 +315,6 @@ function setState(newState) {
     cancelAnimationFrame(app.rafId);
     app.rafId = null;
   }
-  if (newState === STATES.WAITING_STOP) {
-    stopProgressLoop();
-  } else if (app.stopProgressRaf) {
-    cancelAnimationFrame(app.stopProgressRaf);
-    app.stopProgressRaf = null;
-  }
   render();
 }
 
@@ -388,21 +325,6 @@ function rafLoop() {
     renderTimer();
   }
   app.rafId = requestAnimationFrame(rafLoop);
-}
-
-function stopProgressLoop() {
-  if (app.state !== STATES.WAITING_STOP) return;
-  const fill = document.getElementById('stopProgress');
-  if (fill) {
-    if (app.stoppedSince !== null) {
-      const elapsed = performance.now() - app.stoppedSince;
-      const pct = Math.min(100, (elapsed / STOP_CONFIRM_MS) * 100);
-      fill.style.width = pct + '%';
-    } else {
-      fill.style.width = '0%';
-    }
-  }
-  app.stopProgressRaf = requestAnimationFrame(stopProgressLoop);
 }
 
 const $ = function(id) { return document.getElementById(id); };
@@ -416,14 +338,12 @@ function renderGPS() {
   dot.style.background = color;
   dot.style.boxShadow = '0 0 6px ' + color;
   $('gpsAccuracy').textContent = acc ? '±' + acc.toFixed(0) + 'm' : '--';
-  $('speedSource').textContent = app.speedSource !== '--' ? '· ' + app.speedSource : '';
 }
 
 function renderState() {
   const labels = {
     'idle': '待機中',
     'arming': 'GPS取得中',
-    'waiting_stop': '停車確認中',
     'armed': '発進待ち',
     'running': '計測中',
     'finished': '完了'
@@ -431,7 +351,6 @@ function renderState() {
   const colors = {
     'idle': '#6B7280',
     'arming': '#FCD34D',
-    'waiting_stop': '#FB923C',
     'armed': '#FCD34D',
     'running': '#22D3EE',
     'finished': '#34D399'
@@ -444,9 +363,8 @@ function renderState() {
   badge.style.color = c;
   const dot = $('stateDot');
   dot.style.background = c;
-  dot.classList.toggle('pulse', app.state === STATES.RUNNING || app.state === STATES.ARMED || app.state === STATES.WAITING_STOP);
+  dot.classList.toggle('pulse', app.state === STATES.RUNNING || app.state === STATES.ARMED);
 
-  $('msgWaitingStop').classList.toggle('hidden', app.state !== STATES.WAITING_STOP);
   $('msgArmed').classList.toggle('hidden', app.state !== STATES.ARMED);
   if (app.state === STATES.FINISHED) {
     $('msgFinished').textContent = '🏁 計測完了 — ' + formatTime(app.elapsedMs) + '秒';
@@ -568,7 +486,7 @@ $('historyHeader').addEventListener('click', function() {
 
 document.addEventListener('visibilitychange', function() {
   if (document.visibilityState === 'visible' &&
-      (app.state === STATES.WAITING_STOP || app.state === STATES.ARMED || app.state === STATES.RUNNING)) {
+      (app.state === STATES.ARMED || app.state === STATES.RUNNING)) {
     acquireWakeLock();
   }
 });
